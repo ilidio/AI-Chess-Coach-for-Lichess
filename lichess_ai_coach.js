@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Lichess AI Coach v1.19
+// @name         Lichess AI Coach v1.21
 // @namespace    http://tampermonkey.net/
 // @version      1.19
 // @description  Full AI Coach: per-move, full review, AI request, config, persistent open/close state, draggable window (+refresh buttons styled) + window position
@@ -8,7 +8,7 @@
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
-(function() {
+(async function() {
     'use strict';
 
     //////////////////////
@@ -98,7 +98,7 @@
       #coach-tabs { display:flex; border-bottom:1px solid #666; }
       .tab { flex:1; text-align:center; padding:4px; cursor:pointer; background:#222; }
       .tab.active { background:#333; font-weight:bold; }
-      .tab-content { flex:1; overflow-y:auto; padding:6px 0px 6px 6px; white-space:pre-wrap; font-family:monospace; display:none; height:100%; position:relative;}
+      .tab-content { flex:1; overflow-y:auto; padding:6px 0px 0px 6px; white-space:pre-wrap; font-family:monospace; display:none; height:100%; position:relative;}
       .tab-content.active { display:block; }
       input, select, button { font-size:12px; background:#333; color:#eee; border:1px solid #666; border-radius:4px; margin:2px; padding:2px 6px; cursor:pointer; }
       button:hover { background:#444; }
@@ -317,6 +317,12 @@
             const target = coachBox.querySelector(`#${tab.dataset.tab}`);
             if(target) target.classList.add("active");
 
+            if(tab.dataset.tab==="current" || tab.dataset.tab==="per-move" || tab.dataset.tab==="full-review"){
+                const moveIndex = tab.dataset.tab === "current" ? getActiveMoveIndex() : null;
+                conversations[tab.dataset.tab] = loadConversation(tab.dataset.tab, moveIndex);
+                renderConversation(tab.dataset.tab);
+            }
+
             if(tab.dataset.tab==="per-move"){
                 generatePerMoveFull(false);
             }
@@ -458,16 +464,30 @@ Audience: advanced players wanting detailed insights.`
                 const notice = currentDiv.querySelector("div");
                 if(notice) notice.remove();
             },1000);
+            conversations.current = loadConversation('current', info.moveIndex);
+            if (conversations.current.length === 0) {
+                const pgn = await fetchPGN(getGameId());
+                const content=`Current move: ${info.san} (Index: ${info.moveIndex})\nEvaluation: ${info.evaluation}\nPlayer: ${USERNAME} (${getPlayerColor()})\nFull PGN:\n${pgn}\nStockfish PV: ${info.pvLine}`;
+                const initialPrompt = currentStylePrompt[cfg.analysisLevel];
+                const initialUserMessage = {role: "user", content: initialPrompt + "\n" + content};
+                conversations.current = [initialUserMessage, {role: "assistant", content: explanation}];
+                saveConversation('current', info.moveIndex);
+            }
+            renderConversation('current');
         } else {
             currentDiv.innerText="Analysing with LM Studio...";
             try{
                 const pgn = await fetchPGN(getGameId());
                 const content=`Current move: ${info.san} (Index: ${info.moveIndex})\nEvaluation: ${info.evaluation}\nPlayer: ${USERNAME} (${getPlayerColor()})\nFull PGN:\n${pgn}\nStockfish PV: ${info.pvLine}`;
                 const initialPrompt = currentStylePrompt[cfg.analysisLevel];
-                explanation=await askAI([{role: "user", content: initialPrompt + "\n" + content}]);
+                const initialUserMessage = {role: "user", content: initialPrompt + "\n" + content};
+                explanation=await askAI([initialUserMessage]);
+                conversations.current = [initialUserMessage, {role: "assistant", content: explanation}];
+                saveConversation('current', info.moveIndex);
                 cache[key]=explanation;
                 setCache(cache);
                 currentDiv.innerHTML=`<div class="analysis-content">${explanation}</div><button class="refresh-btn" id="refresh-current">🔄 Refresh</button><div id="conversation-current" class="conversation-log"></div><div class="chat-interface"><div class="input-group"><button id="send-ai-current">Send</button><textarea id="user-prompt-current" placeholder="Ask the AI about this analysis..."></textarea></div></div>`;
+                renderConversation('current');
             }catch(e){ currentDiv.innerText="Error: "+e; return; }
         }
 
@@ -483,8 +503,11 @@ Audience: advanced players wanting detailed insights.`
             sendButton.innerText = 'Thinking...';
             sendButton.disabled = true;
             try {
-                const response = await askAI([{role: "user", content: userInput}]);
+                conversations.current.push({role: "user", content: userInput});
+                const response = await askAI(conversations.current);
+                conversations.current.push({role: "assistant", content: response});
                 conversationDiv.innerHTML += `<div class="ai">${response}</div>`;
+                saveConversation('current', getActiveMoveIndex());
             } catch(e) {
                 conversationDiv.innerHTML += `<div class="ai">Error: ${e}</div>`;
             } finally {
@@ -528,23 +551,37 @@ Audience: advanced players wanting detailed insights.`
                 const notice = perMoveDiv.querySelector("div");
                 if(notice) notice.remove();
             },1000);
+            conversations['per-move'] = loadConversation('per-move');
+            if (conversations['per-move'].length === 0) {
+                const pgn = await fetchPGN(getGameId());
+                const initialPrompt = perMoveStylePrompt[cfg.analysisLevel];
+                const initialContent = "PGN:\n" + pgn;
+                const initialUserMessage = {role: "user", content: initialPrompt + "\n" + initialContent};
+                conversations['per-move'] = [initialUserMessage, {role: "assistant", content: analysis}];
+                saveConversation('per-move');
+            }
+            renderConversation('per-move');
         } else {
             perMoveDiv.innerText = "Generating per-move analysis...";
             try {
                 const pgn = await fetchPGN(getGameId());
                 const initialPrompt = perMoveStylePrompt[cfg.analysisLevel];
                 const initialContent = "PGN:\n" + pgn;
-                analysis = await askAI([{role: "user", content: initialPrompt + "\n" + initialContent}]);
+                const initialUserMessage = {role: "user", content: initialPrompt + "\n" + initialContent};
+                analysis = await askAI([initialUserMessage]);
+                conversations['per-move'] = [initialUserMessage, {role: "assistant", content: analysis}];
+                saveConversation('per-move');
                 cache[key] = analysis;
                 setCache(cache);
                 perMoveDiv.innerHTML = `<div class="analysis-content">${analysis}</div><button class="refresh-btn" id="refresh-per-move">🔄 Refresh</button><div id="conversation-per-move" class="conversation-log"></div><div class="chat-interface"><div class="input-group"><button id="send-ai-per-move">Send</button><textarea id="user-prompt-per-move" placeholder="Ask the AI about this analysis..."></textarea></div></div>`;
+                renderConversation('per-move');
             } catch(e) {
                 perMoveDiv.innerText = "Error: " + e;
                 return;
             }
         }
 
-        document.getElementById("refresh-per-move").addEventListener("click",()=>generatePerMoveFull(true));
+        document.getElementById("refresh-per-move").addEventListener("click", () => generatePerMoveFull(true));
 
         document.getElementById("send-ai-per-move").addEventListener("click", async () => {
             const sendButton = document.getElementById("send-ai-per-move");
@@ -556,8 +593,11 @@ Audience: advanced players wanting detailed insights.`
             sendButton.innerText = 'Thinking...';
             sendButton.disabled = true;
             try {
-                const response = await askAI([{role: "user", content: userInput}]);
+                conversations['per-move'].push({role: "user", content: userInput});
+                const response = await askAI(conversations['per-move']);
+                conversations['per-move'].push({role: "assistant", content: response});
                 conversationDiv.innerHTML += `<div class="ai">${response}</div>`;
+                saveConversation('per-move');
             } catch(e) {
                 conversationDiv.innerHTML += `<div class="ai">Error: ${e}</div>`;
             } finally {
@@ -583,6 +623,17 @@ Audience: advanced players wanting detailed insights.`
                 const notice = fullDiv.querySelector("div");
                 if(notice) notice.remove();
             },1000);
+            conversations['full-review'] = loadConversation('full-review');
+            if (conversations['full-review'].length === 0) {
+                const pgn = await fetchPGN(getGameId());
+                const summary = document.querySelector(".advice-summary")?.innerText || "";
+                const initialPrompt = fullReviewStylePrompt[cfg.analysisLevel];
+                const initialContent = "PGN:\n" + pgn + "\n\nSummary:\n" + summary;
+                const initialUserMessage = {role: "user", content: initialPrompt + "\n" + initialContent};
+                conversations['full-review'] = [initialUserMessage, {role: "assistant", content: review}];
+                saveConversation('full-review');
+            }
+            renderConversation('full-review');
         } else {
             fullDiv.innerText = "Generating full review...";
             try {
@@ -590,17 +641,21 @@ Audience: advanced players wanting detailed insights.`
                 const summary=document.querySelector(".advice-summary")?.innerText||"";
                 const initialPrompt = fullReviewStylePrompt[cfg.analysisLevel];
                 const initialContent = "PGN:\n" + pgn + "\n\nSummary:\n" + summary;
-                review = await askAI([{role: "user", content: initialPrompt + "\n" + initialContent}]);
+                const initialUserMessage = {role: "user", content: initialPrompt + "\n" + initialContent};
+                review = await askAI([initialUserMessage]);
+                conversations['full-review'] = [initialUserMessage, {role: "assistant", content: review}];
+                saveConversation('full-review');
                 cache[key] = review;
                 setCache(cache);
                 fullDiv.innerHTML = `<div class="analysis-content">${review}</div><button class="refresh-btn" id="refresh-full">🔄 Refresh</button><div id="conversation-full-review" class="conversation-log"></div><div class="chat-interface"><div class="input-group"><button id="send-ai-full-review">Send</button><textarea id="user-prompt-full-review" placeholder="Ask the AI about this analysis..."></textarea></div></div>`;
+                renderConversation('full-review');
             } catch(e) {
                 fullDiv.innerText = "Error: " + e;
                 return;
             }
         }
 
-        document.getElementById("refresh-full").addEventListener("click",()=>generateFullReview(true));
+        document.getElementById("refresh-full").addEventListener("click", () => generateFullReview(true));
 
         document.getElementById("send-ai-full-review").addEventListener("click", async () => {
             const sendButton = document.getElementById("send-ai-full-review");
@@ -612,8 +667,11 @@ Audience: advanced players wanting detailed insights.`
             sendButton.innerText = 'Thinking...';
             sendButton.disabled = true;
             try {
-                const response = await askAI([{role: "user", content: userInput}]);
+                conversations['full-review'].push({role: "user", content: userInput});
+                const response = await askAI(conversations['full-review']);
+                conversations['full-review'].push({role: "assistant", content: response});
                 conversationDiv.innerHTML += `<div class="ai">${response}</div>`;
+                saveConversation('full-review');
             } catch(e) {
                 conversationDiv.innerHTML += `<div class="ai">Error: ${e}</div>`;
             } finally {
@@ -657,6 +715,39 @@ Audience: advanced players wanting detailed insights.`
         const info=getCurrentMoveInfo();
         if(info.pvLine) return moves.join(" ")+"\n\nStockfish PV (Index: "+(info.moveIndex+1)+"): "+info.pvLine;
         return moves.join(" ");
+    }
+
+    // Conversation histories for each tab
+    let conversations = {
+        current: [],
+        'per-move': [],
+        'full-review': []
+    };
+
+    function saveConversation(tab, moveIndex = null) {
+        const gameId = getGameId();
+        const storageKey = moveIndex !== null ? `lichessTools-conversation-${gameId}-${tab}-${moveIndex}` : `lichessTools-conversation-${gameId}-${tab}`;
+        localStorage.setItem(storageKey, JSON.stringify(conversations[tab]));
+    }
+
+    function loadConversation(tab, moveIndex = null) {
+        const gameId = getGameId();
+        const storageKey = moveIndex !== null ? `lichessTools-conversation-${gameId}-${tab}-${moveIndex}` : `lichessTools-conversation-${gameId}-${tab}`;
+        const stored = localStorage.getItem(storageKey);
+        return stored ? JSON.parse(stored) : [];
+    }
+
+    function renderConversation(tab) {
+        const conversationDiv = document.getElementById(`conversation-${tab}`);
+        if (!conversationDiv) return;
+        conversationDiv.innerHTML = '';
+        conversations[tab].forEach(msg => {
+            if (msg.role === 'user') {
+                conversationDiv.innerHTML += `<div class="user">${msg.content}</div>`;
+            } else if (msg.role === 'assistant') {
+                conversationDiv.innerHTML += `<div class="ai">${msg.content}</div>`;
+            }
+        });
     }
 
 })();
